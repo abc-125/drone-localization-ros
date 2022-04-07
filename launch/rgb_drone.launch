@@ -1,0 +1,25 @@
+<launch>
+  <arg name="input" default="input_images" />
+  <arg name="network_size" default="small" />
+  <arg name="detection_threshold" default="0.5" />
+  <arg name="no_detections_treshold" default="5" />
+
+  <arg name="config_small" default="$(find drone_localization_ros)/detectron2/configs/COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml" />
+  <arg name="model_small" default="$(find drone_localization_ros)/weights/rgb_resnet50_320x256.pth" />
+  <arg name="config_large" default="$(find drone_localization_ros)/detectron2/configs/COCO-Detection/faster_rcnn_X_101_32x8d_FPN_3x.yaml" />
+  <arg name="model_large" default="$(find drone_localization_ros)/weights/rgb_resnet101_880x680.pth" />
+
+  <arg name="visualization" default="true" />
+
+  <node name="drone_localization_ros"  pkg="drone_localization_ros" type="drone_localization_ros" output="screen" >
+    <param name="input" value="$(arg input)" />
+    <param name="network_size" value="$(arg network_size)" />
+    <param name="detection_threshold" value="$(arg detection_threshold)" />
+    <param name="no_detections_treshold" value="$(arg no_detections_treshold)" />
+    <param name="config_small" value="$(arg config_small)" />
+    <param name="model_small" value="$(arg model_small)" />
+    <param name="config_large" value="$(arg config_large)" />
+    <param name="model_large" value="$(arg model_large)" />
+    <param name="visualization" value="$(arg visualization)" />
+  </node>
+</launch>

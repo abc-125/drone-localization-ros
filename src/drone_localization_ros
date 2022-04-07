@@ -1,0 +1,234 @@
+#!/usr/bin/env python
+
+# based on https://github.com/DavidFernandezChaves/Detectron2_ros
+
+import sys
+import threading
+import time
+
+import cv2 as cv
+import numpy as np
+import rospy
+from detectron2.config import get_cfg
+from detectron2.data import MetadataCatalog
+from cv_bridge import CvBridge
+
+from detectron2.utils.logger import setup_logger
+from detectron2.utils.visualizer import Visualizer
+from drone_localization_ros.msg import Detection, Detections
+from sensor_msgs.msg import Image
+
+from predictorNoResize import PredictorNoResize
+
+
+
+class DroneLocalizationNode(object):
+    def __init__(self):
+        rospy.logwarn("Initializing")
+        setup_logger()
+
+        self._bridge = CvBridge()
+        self._last_msg = None
+        self._msg_lock = threading.Lock()
+        self._image_counter = 0
+
+        self.small_input_size = (320, 256)
+        self.large_input_size = (880, 680)
+
+        self.mode = self.load_param('~network_size')  # small / large / dual
+
+        # either small or large neural network
+        if self.mode != "dual":
+            self.cfg1 = get_cfg()
+
+            if self.mode == "small":
+                self.cfg1.merge_from_file(self.load_param('~config_small'))
+                self.cfg1.MODEL.WEIGHTS = self.load_param('~model_small')
+                self.cfg1.MODEL.ANCHOR_GENERATOR.SIZES = [[8, 16, 32, 64]]
+
+            if self.mode == "large":
+                self.cfg1.merge_from_file(self.load_param('~config_large'))
+                self.cfg1.MODEL.WEIGHTS = self.load_param('~model_large')
+                self.cfg1.MODEL.ANCHOR_GENERATOR.SIZES = [[16, 32, 64, 128, 256]]
+
+            self.cfg1.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.load_param('~detection_threshold')
+            self.cfg1.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = [[0.5, 1.0]]
+            self.cfg1.MODEL.ROI_HEADS.NUM_CLASSES = 1 
+            self.cfg1.MODEL.DEVICE='cpu'  # for test and compatibility
+
+            self.predictor = PredictorNoResize(self.cfg1)
+
+            MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]).set(thing_classes=["drone"])  # set class name
+            self._class_names = MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]).get("thing_classes", None)
+    
+        # both neural networks
+        if self.mode == "dual":
+            self.no_detections_treshold = self.load_param('~no_detections_treshold')
+
+            self.cfg1 = get_cfg()
+            self.cfg1.merge_from_file(self.load_param('~config_small'))
+            self.cfg1.MODEL.WEIGHTS = self.load_param('~model_small')
+            self.cfg1.MODEL.ANCHOR_GENERATOR.SIZES = [[8, 16, 32, 64]]
+
+            self.cfg2 = get_cfg()
+            self.cfg2.merge_from_file(self.load_param('~config_large'))
+            self.cfg2.MODEL.WEIGHTS = self.load_param('~model_large')
+            self.cfg2.MODEL.ANCHOR_GENERATOR.SIZES = [[16, 32, 64, 128, 256]]
+            
+            self.cfg1.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.cfg2.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.load_param('~detection_threshold')
+            self.cfg1.MODEL.ROI_HEADS.NUM_CLASSES = self.cfg2.MODEL.ROI_HEADS.NUM_CLASSES = 1 
+            self.cfg1.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = self.cfg2.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = [[0.5, 1.0]]
+            self.cfg1.MODEL.DEVICE = self.cfg2.MODEL.DEVICE = 'cpu'  # for test and compatibility
+
+            self.predictor1 = PredictorNoResize(self.cfg1)
+            self.predictor2 = PredictorNoResize(self.cfg2)
+
+            MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]).set(thing_classes=["drone"])  # set class name
+            self._class_names = MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]).get("thing_classes", None)
+
+        self._visualization = self.load_param('~visualization',True)
+        self._result_pub = rospy.Publisher('~detections', Detections, queue_size=1)
+        self._vis_pub = rospy.Publisher('~visualization', Image, queue_size=1)
+        self._sub = rospy.Subscriber(self.load_param('~input'), Image, self.callback_image, queue_size=1)
+        self.start_time = time.time()
+        rospy.logwarn("Initialized")
+
+
+    def run(self):
+        rate = rospy.Rate(100)
+        detections_counter = 0
+
+        while not rospy.is_shutdown():
+            if self._msg_lock.acquire(False):
+                img_msg = self._last_msg
+                self._last_msg = None
+                self._msg_lock.release()
+            else:
+                rate.sleep()
+                continue
+
+            if img_msg is not None:
+                self._image_counter = self._image_counter + 1
+                if (self._image_counter % 11) == 10:
+                    rospy.loginfo("Images detected per second=%.2f",
+                                  float(self._image_counter) / (time.time() - self.start_time))
+
+                np_image = self.convert_to_cv_image(img_msg)
+
+                # small or large mode (one neural network)
+                if self.mode != "dual":
+                    if self.mode == "small":
+                        np_image = cv.resize(np_image, self.small_input_size)
+                    if self.mode == "large":
+                        np_image = cv.resize(np_image, self.large_input_size)
+
+                    outputs = self.predictor(np_image)
+                    detections = outputs["instances"].to("cpu")
+
+                # dual mode (two neural networks)
+                else:
+                    if detections_counter < self.no_detections_treshold:
+                        np_image = cv.resize(np_image, self.small_input_size)
+                        outputs = self.predictor1(np_image)  # use faster network
+                    else:
+                        rospy.loginfo("Cannot detect target, using larger neural network for detection...")
+                        np_image = cv.resize(np_image, self.large_input_size)
+                        outputs = self.predictor2(np_image)  # use slower network if no detections for some number of images
+                    detections = outputs["instances"].to("cpu")    
+
+                    if not detections:
+                        detections_counter += 1
+                    else:
+                        detections_counter = 0
+
+                # publish detections
+                detections_msg = self.get_detections_msg(detections)
+                self._result_pub.publish(detections_msg)
+                #rospy.loginfo(detections_msg)
+
+                # calculate relative drone localization
+                # TODO
+
+
+                # visualize results
+                if self._visualization:
+                    v = Visualizer(np_image[:, :, ::-1], MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]), scale=1.0)
+                    v = v.draw_instance_predictions(detections)
+                    img = v.get_image()[:, :, ::-1]
+
+                    image_msg = self._bridge.cv2_to_imgmsg(img, 'bgr8')
+                    self._vis_pub.publish(image_msg)
+
+            rate.sleep()
+
+    def get_detections_msg(self, detections):
+
+        boxes = detections.pred_boxes if detections.has("pred_boxes") else None
+
+        dets_msg = Detections()
+        dets_msg.header = self._header
+
+        for i, (x1, y1, x2, y2) in enumerate(boxes):
+            det_msg = Detection()
+
+            det_msg.class_id = detections.pred_classes[i].numpy()
+            det_msg.label = self._class_names[det_msg.class_id]
+            det_msg.confidence = detections.scores[i].numpy()
+
+            det_msg.xmin = np.uint32(x1)
+            det_msg.ymin = np.uint32(y1)
+            det_msg.xmax = np.uint32(x2)
+            det_msg.ymax = np.uint32(y2)
+
+            dets_msg.detections.append(det_msg)
+
+        return dets_msg
+
+    def convert_to_cv_image(self, image_msg):
+
+        if image_msg is None:
+            return None
+
+        self._width = image_msg.width
+        self._height = image_msg.height
+        channels = int(len(image_msg.data) / (self._width * self._height))
+
+        encoding = None
+        if image_msg.encoding.lower() in ['rgb8', 'bgr8']:
+            encoding = np.uint8
+        elif image_msg.encoding.lower() == 'mono8':
+            encoding = np.uint8
+        elif image_msg.encoding.lower() == '32fc1':
+            encoding = np.float32
+            channels = 1
+
+        cv_img = np.ndarray(shape=(image_msg.height, image_msg.width, channels),
+                            dtype=encoding, buffer=image_msg.data)
+
+        if image_msg.encoding.lower() == 'mono8':
+            cv_img = cv.cvtColor(cv_img, cv.COLOR_RGB2GRAY)
+        else:
+            cv_img = cv.cvtColor(cv_img, cv.COLOR_RGB2BGR)
+
+        return cv_img
+
+    def callback_image(self, msg):
+        rospy.logdebug("Get an image")
+        if self._msg_lock.acquire(False):
+            self._last_msg = msg
+            self._header = msg.header
+            self._msg_lock.release()
+
+    @staticmethod
+    def load_param(param, default=None):
+        new_param = rospy.get_param(param, default)
+        rospy.loginfo("[DroneLocalization] %s: %s", param, new_param)
+        return new_param
+
+def main(argv):
+    rospy.init_node('drone_localization_ros')
+    node = DroneLocalizationNode()
+    node.run()
+
+if __name__ == '__main__':
+    main(sys.argv)
