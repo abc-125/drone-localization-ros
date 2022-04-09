@@ -151,7 +151,7 @@ class DroneLocalizationNode(object):
                 self._detections_pub.publish(dets_msg)
                 #rospy.loginfo(detections_msg)
 
-                # calculate relative drone localization
+                # calculate relative localizations
                 poses_msg = PosesWithCovariance()
                 for det in dets_msg.detections:
                     x_mid = det.xmin + (det.xmax - det.xmin)/2.0
@@ -174,26 +174,10 @@ class DroneLocalizationNode(object):
                         pose_w_cov_msg.pose.orientation.z = 0
                         pose_w_cov_msg.pose.orientation.w = 1
 
-                        # calculate covariance
-                        cov_matrix = np.identity(3)
-                        cov_matrix[0][0] = cov_matrix[1][1] = self.covariance_xy
-                        cov_matrix[2][2] = position_vector[2] * np.sqrt(position_vector[2]) * self.covariance_z
-                        if cov_matrix[2][2] < 0.33 * self.covariance_z:
-                            cov_matrix[2][2] = 0.33 * self.covariance_z
-                        # rotation
-                        rotation_vector = self.rotation_matrix_from_vectors(np.array([0.0, 0.0, 1.0]), position_vector)
-                        rotated_cov = rotation_vector * cov_matrix * np.transpose(rotation_vector)
-                        # fill cov matrix
-                        cov = [0.0] * 36
-                        for r in range(6):
-                            for c in range(6):
-                                if r < 3 and c < 3:
-                                    cov[r * 6 + c] = rotated_cov[r][c]
-                                elif r == c:
-                                    cov[r * 6 + c] = 999
-                        pose_w_cov_msg.covariance = cov
+                        pose_w_cov_msg.covariance = self.generate_covariance(position_vector)
+                        
                         poses_msg.poses.append(pose_w_cov_msg)
-                        print(pose_w_cov_msg.pose.position)
+                        print(pose_w_cov_msg.pose.position) # TODO
                     else:
                         rospy.logerr("Invalid distance estimate {}! Skipping detection.".format(estimated_distance)) 
 
@@ -240,6 +224,7 @@ class DroneLocalizationNode(object):
 
         return dets_msg
 
+
     def convert_to_cv_image(self, image_msg):
         if image_msg is None:
             return None
@@ -252,6 +237,7 @@ class DroneLocalizationNode(object):
             cv_img = cv.normalize(cv_img, None, 0, 255, cv.NORM_MINMAX, cv.CV_8U)  # normalizing for thermal images
 
         return cv_img
+
 
     def rotation_matrix_from_vectors(self, vec1, vec2):
         """ Find the rotation matrix that aligns vec1 to vec2
@@ -267,8 +253,30 @@ class DroneLocalizationNode(object):
         rotation_matrix = np.eye(3) + kmat + kmat.dot(kmat) * ((1 - c) / (s ** 2))
         return rotation_matrix
 
-    #def generate_covariance(center_vector, right_vector): # TODO
-        #return dets_msg
+
+    def generate_covariance(self, position_vector):
+        # calculate covariance
+        cov_matrix = np.identity(3)
+        cov_matrix[0][0] = cov_matrix[1][1] = self.covariance_xy
+        cov_matrix[2][2] = position_vector[2] * np.sqrt(position_vector[2]) * self.covariance_z
+        if cov_matrix[2][2] < 0.33 * self.covariance_z:
+            cov_matrix[2][2] = 0.33 * self.covariance_z
+
+        # rotation
+        rotation_vector = self.rotation_matrix_from_vectors(np.array([0.0, 0.0, 1.0]), position_vector)
+        rotated_cov = rotation_vector * cov_matrix * np.transpose(rotation_vector)
+        
+        # fill covariance matrix
+        cov = [0.0] * 36
+        for r in range(6):
+            for c in range(6):
+                if r < 3 and c < 3:
+                    cov[r * 6 + c] = rotated_cov[r][c]
+                elif r == c:
+                    cov[r * 6 + c] = 999
+
+        return cov
+
 
     def callback_image(self, msg):
         rospy.logdebug("Got an image")
@@ -276,6 +284,7 @@ class DroneLocalizationNode(object):
             self._last_msg = msg
             self._header = msg.header
             self._msg_lock.release()
+
 
     def callback_cam_info(self, msg):
         rospy.logdebug("Got camera info")
@@ -287,16 +296,19 @@ class DroneLocalizationNode(object):
             #                        0.0, 0.0, 0.0, 0.0]
             self.camera.fromCameraInfo(self._camera_info)
 
+
     @staticmethod
     def load_param(param, default=None):
         new_param = rospy.get_param(param, default)
         rospy.loginfo("[DroneLocalization] %s: %s", param, new_param)
         return new_param
 
+
 def main(argv):
     rospy.init_node('drone_localization_ros')
     node = DroneLocalizationNode()
     node.run()
+
 
 if __name__ == '__main__':
     main(sys.argv)
