@@ -6,6 +6,7 @@ find_package(catkin REQUIRED COMPONENTS
   message_generation
   std_msgs
   sensor_msgs
+  geometry_msgs
 )
 
 ## System dependencies are found with CMake's conventions
@@ -21,12 +22,14 @@ add_message_files(
   FILES
     Detection.msg
     Detections.msg
+    PosesWithCovariance.msg
 )
 
 generate_messages(
   DEPENDENCIES
   std_msgs
   sensor_msgs
+  geometry_msgs
 )
 
 catkin_package(
