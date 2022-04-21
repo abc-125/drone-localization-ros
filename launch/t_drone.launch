@@ -23,7 +23,8 @@
 
   <arg name="input_images" default="/thermal/image_raw" />
   <arg name="camera_info" default="/thermal/camera_info" />
-  <arg name="network_size" default="small" />
+  <arg name="network_mode" default="small" />
+  <arg name="is_fusion" default="False" />
   <arg name="detection_threshold" default="0.5" />
   <arg name="no_detections_treshold" default="5" />
   <arg name="drone_width" default="0.3" />
@@ -38,7 +39,8 @@
   <node name="drone_localization_ros"  pkg="drone_localization_ros" type="drone_localization_ros" output="screen" >
     <param name="input_images" value="$(arg input_images)" />
     <param name="camera_info" value="$(arg camera_info)" />
-    <param name="network_size" value="$(arg network_size)" />
+    <param name="network_mode" value="$(arg network_mode)" />
+    <param name="is_fusion" value="$(arg is_fusion)" />
     <param name="detection_threshold" value="$(arg detection_threshold)" />
     <param name="no_detections_treshold" value="$(arg no_detections_treshold)" />
     <param name="drone_width" value="$(arg drone_width)" />

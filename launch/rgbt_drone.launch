@@ -21,24 +21,30 @@
   <!-- Namespace -->
   <group ns="$(arg UAV_NAME)">
 
-  <arg name="input_images" default="/uav1/rs_d435/color/image_raw" />
-  <arg name="camera_info" default="/uav1/rs_d435/color/camera_info" />
+  <arg name="input_images_rgb" default="/rs_d435/color/image_rect_color" />
+  <arg name="camera_info_rgb" default="/rs_d435/color/camera_info" />
+  <arg name="input_images_t" default="/thermal/image_raw" />
+  <arg name="camera_info_t" default="/thermal/camera_info" />
+
   <arg name="network_mode" default="large" />
-  <arg name="is_fusion" default="False" />
+  <arg name="is_fusion" default="True" />
+
   <arg name="detection_threshold" default="0.5" />
   <arg name="no_detections_treshold" default="5" />
-  <arg name="drone_width" default="0.7" />
+  <arg name="drone_width" default="0.52" />
 
   <arg name="config_small" default="$(find drone_localization_ros)/detectron2/configs/COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml" />
-  <arg name="model_small" default="$(find drone_localization_ros)/weights/rgb_resnet50_320x256.pth" />
+  <arg name="model_small" default="$(find drone_localization_ros)/weights/rgbt_resnet50_320x256.pth" />
   <arg name="config_large" default="$(find drone_localization_ros)/detectron2/configs/COCO-Detection/faster_rcnn_X_101_32x8d_FPN_3x.yaml" />
-  <arg name="model_large" default="$(find drone_localization_ros)/weights/rgb_resnet101_880x680.pth" />
+  <arg name="model_large" default="$(find drone_localization_ros)/weights/rgbt_halfway_fusion_ap81.pth" />
 
   <arg name="visualization" default="true" />
 
   <node name="drone_localization_ros"  pkg="drone_localization_ros" type="drone_localization_ros" output="screen" >
-    <param name="input_images" value="$(arg input_images)" />
-    <param name="camera_info" value="$(arg camera_info)" />
+    <param name="input_images_rgb" value="$(arg input_images_rgb)" />
+    <param name="camera_info_rgb" value="$(arg camera_info_rgb)" />
+    <param name="input_images_t" value="$(arg input_images_t)" />
+    <param name="camera_info_t" value="$(arg camera_info_t)" />
     <param name="network_mode" value="$(arg network_mode)" />
     <param name="is_fusion" value="$(arg is_fusion)" />
     <param name="detection_threshold" value="$(arg detection_threshold)" />

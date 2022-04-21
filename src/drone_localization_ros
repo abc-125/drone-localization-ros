@@ -9,18 +9,20 @@ import time
 import cv2 as cv
 import numpy as np
 import rospy
-from detectron2.config import get_cfg
-from detectron2.data import MetadataCatalog
 from cv_bridge import CvBridge
 from image_geometry import PinholeCameraModel
 
+from detectron2.config import get_cfg
+from detectron2.data import MetadataCatalog
 from detectron2.utils.logger import setup_logger
 from detectron2.utils.visualizer import Visualizer
+
 from drone_localization_ros.msg import Detection, Detections, PosesWithCovariance
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PoseWithCovariance
+import message_filters
 
 from predictorNoResize import PredictorNoResize
+from localization import get_poses_msg
 
 
 
@@ -28,6 +30,12 @@ class DroneLocalizationNode(object):
     def __init__(self):
         rospy.logwarn("Initializing")
         setup_logger()
+
+        self.mode = self.load_param('~network_mode')  # small / large / dual
+        self.is_fusion = self.load_param('~is_fusion')  # use halfway fusion or not
+
+        if self.is_fusion:
+            from halfway_fusion.predictor import HalfwayFusionPredictor
 
         self._bridge = CvBridge()
         self._last_msg = None
@@ -40,10 +48,8 @@ class DroneLocalizationNode(object):
         self.covariance_xy = 0.05
         self.covariance_z = 0.5
 
-        self.mode = self.load_param('~network_size')  # small / large / dual
-
-        self.small_input_size = (320, 256)
-        self.large_input_size = (880, 680)
+        self.original_input_size = None
+        self.input_size = (640, 512)
 
         # either small or large neural network
         if self.mode != "dual":
@@ -52,22 +58,23 @@ class DroneLocalizationNode(object):
             if self.mode == "small":
                 self.cfg1.merge_from_file(self.load_param('~config_small'))
                 self.cfg1.MODEL.WEIGHTS = self.load_param('~model_small')
-                self.cfg1.MODEL.ANCHOR_GENERATOR.SIZES = [[8, 16, 32, 64]]
 
             if self.mode == "large":
                 self.cfg1.merge_from_file(self.load_param('~config_large'))
                 self.cfg1.MODEL.WEIGHTS = self.load_param('~model_large')
-                self.cfg1.MODEL.ANCHOR_GENERATOR.SIZES = [[16, 32, 64, 128, 256]]
 
+            self.cfg1.MODEL.ANCHOR_GENERATOR.SIZES = [[16, 32, 64, 128, 256]]
             self.cfg1.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.load_param('~detection_threshold')
             self.cfg1.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = [[0.5, 1.0]]
             self.cfg1.MODEL.ROI_HEADS.NUM_CLASSES = 1 
             self.cfg1.MODEL.DEVICE='cpu'  # for test and compatibility
 
-            self.predictor = PredictorNoResize(self.cfg1)
-
-            MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]).set(thing_classes=["drone"])  # set class name
-            self._class_names = MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]).get("thing_classes", None)
+            if self.is_fusion:
+                self.cfg1.MODEL.META_ARCHITECTURE = "HalfwayFusionRCNN"
+                self.cfg1.MODEL.BACKBONE.NAME = "build_hw_fusion_resnet_fpn_backbone"
+                self.predictor = HalfwayFusionPredictor(self.cfg1)
+            else:
+                self.predictor = PredictorNoResize(self.cfg1)
     
         # both neural networks
         if self.mode == "dual":
@@ -76,30 +83,45 @@ class DroneLocalizationNode(object):
             self.cfg1 = get_cfg()
             self.cfg1.merge_from_file(self.load_param('~config_small'))
             self.cfg1.MODEL.WEIGHTS = self.load_param('~model_small')
-            self.cfg1.MODEL.ANCHOR_GENERATOR.SIZES = [[8, 16, 32, 64]]
 
             self.cfg2 = get_cfg()
             self.cfg2.merge_from_file(self.load_param('~config_large'))
             self.cfg2.MODEL.WEIGHTS = self.load_param('~model_large')
-            self.cfg2.MODEL.ANCHOR_GENERATOR.SIZES = [[16, 32, 64, 128, 256]]
-            
+
+            self.cfg1.MODEL.ANCHOR_GENERATOR.SIZES = self.cfg2.MODEL.ANCHOR_GENERATOR.SIZES = [[16, 32, 64, 128, 256]]            
             self.cfg1.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.cfg2.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.load_param('~detection_threshold')
             self.cfg1.MODEL.ROI_HEADS.NUM_CLASSES = self.cfg2.MODEL.ROI_HEADS.NUM_CLASSES = 1 
             self.cfg1.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = self.cfg2.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = [[0.5, 1.0]]
             self.cfg1.MODEL.DEVICE = self.cfg2.MODEL.DEVICE = 'cpu'  # for test and compatibility
 
-            self.predictor1 = PredictorNoResize(self.cfg1)
-            self.predictor2 = PredictorNoResize(self.cfg2)
+            if self.is_fusion:
+                self.cfg1.MODEL.META_ARCHITECTURE = self.cfg2.MODEL.META_ARCHITECTURE = "HalfwayFusionRCNN"
+                self.cfg1.MODEL.BACKBONE.NAME = self.cfg2.MODEL.META_ARCHITECTURE = "build_hw_fusion_resnet_fpn_backbone"
+                self.predictor1 = HalfwayFusionPredictor(self.cfg1)
+                self.predictor2 = HalfwayFusionPredictor(self.cfg2)
+            else:
+                self.predictor1 = PredictorNoResize(self.cfg1)
+                self.predictor2 = PredictorNoResize(self.cfg2)
 
-            MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]).set(thing_classes=["drone"])  # set class name
-            self._class_names = MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]).get("thing_classes", None)
+        MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]).set(thing_classes=["drone"])  # set class name
+        self._class_names = MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]).get("thing_classes", None)
 
         self._visualization = self.load_param('~visualization', True)
+
         self._detections_pub = rospy.Publisher('~detections', Detections, queue_size=1)
         self._poses_pub = rospy.Publisher('~poses', PosesWithCovariance, queue_size=1)
         self._vis_pub = rospy.Publisher('~visualization', Image, queue_size=1)
-        self._sub = rospy.Subscriber(self.load_param('~input_images'), Image, self.callback_image, queue_size=1)
-        self._sub_cam_info = rospy.Subscriber(self.load_param('~camera_info'), CameraInfo, self.callback_cam_info, queue_size=1)
+
+        if self.is_fusion:
+            sub_rgb = message_filters.Subscriber(self.load_param('~input_images_rgb'), Image, queue_size=1)
+            self._sub_cam_info_rgb = rospy.Subscriber(self.load_param('~camera_info_rgb'), CameraInfo, self.callback_cam_info, queue_size=1)
+            sub_t = message_filters.Subscriber(self.load_param('~input_images_t'), Image, queue_size=1)
+            self._sync_images = message_filters.ApproximateTimeSynchronizer([sub_rgb, sub_t], queue_size=5, slop=0.1)
+            self._sync_images.registerCallback(self.callback_sync_images)
+        else:
+            self._sub = rospy.Subscriber(self.load_param('~input_images'), Image, self.callback_image, queue_size=1)
+            self._sub_cam_info = rospy.Subscriber(self.load_param('~camera_info'), CameraInfo, self.callback_cam_info, queue_size=1)
+
         self.start_time = time.time()
         rospy.logwarn("Initialized")
 
@@ -118,74 +140,52 @@ class DroneLocalizationNode(object):
                 continue
 
             if img_msg and self._camera_info:
-                np_image = self.convert_to_cv_image(img_msg)
+                # convert and resize one input image or both
+                if not self.is_fusion:
+                    np_image = self.convert_to_cv_image(img_msg)
+                    np_image = cv.resize(np_image, self.input_size)
+                else:
+                    np_image_rgb, np_image_t = self.convert_to_cv_image(img_msg[0]), self.convert_to_cv_image(img_msg[1])
+                    crop_w = int(img_msg[1].height / img_msg[1].width * img_msg[0].width)
+                    diff = int((img_msg[0].width - crop_w) / 2)
+                    np_image_rgb = np_image_rgb[0:img_msg[0].height, diff:crop_w + diff] # crop rgb image
+                    np_image_rgb, np_image_t = cv.resize(np_image_rgb, self.input_size), cv.resize(np_image_t, self.input_size)
+                    np_image = np_image_rgb, np_image_t
                 
                 # small or large mode (one neural network)
                 if self.mode != "dual":
-                    if self.mode == "small":
-                        np_image = cv.resize(np_image, self.small_input_size)
-                    if self.mode == "large":
-                        np_image = cv.resize(np_image, self.large_input_size)
-
                     outputs = self.predictor(np_image)
-                    detections = outputs["instances"].to("cpu")
 
                 # dual mode (two neural networks)
                 else:
                     if detections_counter < self.no_detections_treshold:
-                        np_image = cv.resize(np_image, self.small_input_size)
                         outputs = self.predictor1(np_image)  # use faster network
                     else:
-                        rospy.loginfo("Cannot detect target, using larger neural network for detection...")
-                        np_image = cv.resize(np_image, self.large_input_size)
-                        outputs = self.predictor2(np_image)  # use slower network if no detections for some number of images
-                    detections = outputs["instances"].to("cpu")    
+                        rospy.loginfo("[DroneLocalization]: Cannot detect target, using larger neural network for detection...")
+                        outputs = self.predictor2(np_image)  # use slower network if no detections for some number of images                      
 
                     if not detections:
                         detections_counter += 1
                     else:
                         detections_counter = 0
 
+                detections = outputs["instances"].to("cpu") 
+
                 # publish detections
                 dets_msg = self.get_detections_msg(detections)
                 self._detections_pub.publish(dets_msg)
-                #rospy.loginfo(detections_msg)
+                #rospy.loginfo(dets_msg)
 
                 # calculate relative localizations
-                poses_msg = PosesWithCovariance()
-                for det in dets_msg.detections:
-                    x_mid = det.xmin + (det.xmax - det.xmin)/2.0
-                    y_mid = det.ymin + (det.ymax - det.ymin)/2.0
-                    center_vector = np.array(self.camera.projectPixelTo3dRay((x_mid, y_mid)))  # self.camera.rectifyPoint TODO?
-                    right_vector = np.array(self.camera.projectPixelTo3dRay((det.xmax, y_mid)))
-
-                    estimated_distance = self._drone_width / 2.0 * np.linalg.norm(center_vector) \
-                        / np.linalg.norm(right_vector - center_vector)
-
-                    if estimated_distance > 0 and estimated_distance is not np.NaN:
-                        print("estimated_distance: " + str(estimated_distance))  # TODO
-                        position_vector = estimated_distance * center_vector
-                        pose_w_cov_msg = PoseWithCovariance()
-                        pose_w_cov_msg.pose.position.x = position_vector[0]
-                        pose_w_cov_msg.pose.position.y = position_vector[1]
-                        pose_w_cov_msg.pose.position.z = position_vector[2]
-                        pose_w_cov_msg.pose.orientation.x = 0
-                        pose_w_cov_msg.pose.orientation.y = 0
-                        pose_w_cov_msg.pose.orientation.z = 0
-                        pose_w_cov_msg.pose.orientation.w = 1
-
-                        pose_w_cov_msg.covariance = self.generate_covariance(position_vector)
-                        
-                        poses_msg.poses.append(pose_w_cov_msg)
-                        print(pose_w_cov_msg.pose.position) # TODO
-                    else:
-                        rospy.logerr("Invalid distance estimate {}! Skipping detection.".format(estimated_distance)) 
-
+                poses_msg = get_poses_msg(self, dets_msg)
                 self._poses_pub.publish(poses_msg)
                    
                 # visualize results
                 if self._visualization:
-                    v = Visualizer(np_image[:, :, ::-1], MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]), scale=1.0)
+                    if not self.is_fusion:
+                        v = Visualizer(np_image[:, :, ::-1], MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]), scale=1.0)
+                    else:
+                        v = Visualizer(np_image[0][:, :, ::-1], MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]), scale=1.0)
                     v = v.draw_instance_predictions(detections)
                     img = v.get_image()[:, :, ::-1]
 
@@ -202,7 +202,6 @@ class DroneLocalizationNode(object):
 
 
     def get_detections_msg(self, detections):
-
         boxes = detections.pred_boxes if detections.has("pred_boxes") else None
 
         dets_msg = Detections()
@@ -239,47 +238,22 @@ class DroneLocalizationNode(object):
         return cv_img
 
 
-    def rotation_matrix_from_vectors(self, vec1, vec2):
-        """ Find the rotation matrix that aligns vec1 to vec2
-        :param vec1: A 3d "source" vector
-        :param vec2: A 3d "destination" vector
-        :return mat: A transform matrix (3x3) which when applied to vec1, aligns it with vec2.
-        """
-        a, b = (vec1 / np.linalg.norm(vec1)).reshape(3), (vec2 / np.linalg.norm(vec2)).reshape(3)
-        v = np.cross(a, b)
-        c = np.dot(a, b)
-        s = np.linalg.norm(v)
-        kmat = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
-        rotation_matrix = np.eye(3) + kmat + kmat.dot(kmat) * ((1 - c) / (s ** 2))
-        return rotation_matrix
+    def callback_sync_images(self, image_rgb, image_t):     
+        rospy.logdebug("Got both images")
+        crop_w = int(image_t.height / image_t.width * image_rgb.width)
+        if not self.original_input_size:
+            self.original_input_size = (crop_w, image_rgb.height)
 
-
-    def generate_covariance(self, position_vector):
-        # calculate covariance
-        cov_matrix = np.identity(3)
-        cov_matrix[0][0] = cov_matrix[1][1] = self.covariance_xy
-        cov_matrix[2][2] = position_vector[2] * np.sqrt(position_vector[2]) * self.covariance_z
-        if cov_matrix[2][2] < 0.33 * self.covariance_z:
-            cov_matrix[2][2] = 0.33 * self.covariance_z
-
-        # rotation
-        rotation_vector = self.rotation_matrix_from_vectors(np.array([0.0, 0.0, 1.0]), position_vector)
-        rotated_cov = rotation_vector * cov_matrix * np.transpose(rotation_vector)
-        
-        # fill covariance matrix
-        cov = [0.0] * 36
-        for r in range(6):
-            for c in range(6):
-                if r < 3 and c < 3:
-                    cov[r * 6 + c] = rotated_cov[r][c]
-                elif r == c:
-                    cov[r * 6 + c] = 999
-
-        return cov
+        if self._msg_lock.acquire(False):
+            self._last_msg = (image_rgb, image_t)
+            self._header = image_rgb.header
+            self._msg_lock.release()
 
 
     def callback_image(self, msg):
         rospy.logdebug("Got an image")
+        if not self.original_input_size:
+            self.original_input_size = (msg.width, msg.height)
         if self._msg_lock.acquire(False):
             self._last_msg = msg
             self._header = msg.header
@@ -287,13 +261,24 @@ class DroneLocalizationNode(object):
 
 
     def callback_cam_info(self, msg):
+        #     [fx'  0  cx' Tx]
+        # P = [ 0  fy' cy' Ty]
+        #     [ 0   0   1   0]
         rospy.logdebug("Got camera info")
-        if not self._camera_info:
+        if not self._camera_info and self.original_input_size:
             self._camera_info = msg
-            print(self._camera_info)
-            #self._camera_info.P = [1.0, 0.0, 0.0, 0.0,   # TODO cannot get this matrix from thermal camera for some reason
-            #                        0.0, 1.0, 0.0, 0.0, 
-            #                        0.0, 0.0, 0.0, 0.0]
+
+            fx = self._camera_info.P[0] / self.original_input_size[0] * self.input_size[0]
+            fy = self._camera_info.P[5] / self.original_input_size[1] * self.input_size[1]
+            cx = self.input_size[0] / 2
+            cy = self.input_size[1] / 2
+            self._camera_info.P = list(self._camera_info.P)
+            self._camera_info.P[0] = fx
+            self._camera_info.P[5] = fy
+            self._camera_info.P[2] = cx
+            self._camera_info.P[6] = cy
+            self._camera_info.P = tuple(self._camera_info.P)
+
             self.camera.fromCameraInfo(self._camera_info)
 
 
