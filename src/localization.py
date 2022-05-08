@@ -52,10 +52,10 @@ def rotation_matrix_from_vectors(source, dest):
 def generate_covariance(node, position_vector):
     # calculate covariance
     cov_matrix = np.identity(3)
-    cov_matrix[0][0] = cov_matrix[1][1] = node.covariance_xy
-    cov_matrix[2][2] = position_vector[2] * np.sqrt(position_vector[2]) * node.covariance_z
-    if cov_matrix[2][2] < 0.33 * node.covariance_z:
-        cov_matrix[2][2] = 0.33 * node.covariance_z
+    cov_matrix[0][0] = cov_matrix[1][1] = node._covariance_xy
+    cov_matrix[2][2] = position_vector[2] * np.sqrt(position_vector[2]) * node._covariance_z
+    if cov_matrix[2][2] < 0.33 * node._covariance_z:
+        cov_matrix[2][2] = 0.33 * node._covariance_z
 
     # rotation
     rotation_vector = rotation_matrix_from_vectors(np.array([0.0, 0.0, 1.0]), position_vector)

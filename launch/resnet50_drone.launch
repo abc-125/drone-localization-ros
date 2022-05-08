@@ -21,33 +21,31 @@
   <!-- Namespace -->
   <group ns="$(arg UAV_NAME)">
 
-  <arg name="input_images" default="/thermal/image_raw" />
-  <arg name="camera_info" default="/thermal/camera_info" />
-  <arg name="network_mode" default="small" />
-  <arg name="is_fusion" default="False" />
-  <arg name="detection_threshold" default="0.5" />
+  <arg name="input_rgb" default="/camera/realsense2_camera/color/image_raw" />
+  <arg name="input_t" default="/thermal/image_rect_color" />
+  <arg name="camera_info" default="/camera/realsense2_camera/color/camera_info" />
+  <arg name="network_mode" default="thermal" />
   <arg name="no_detections_treshold" default="5" />
-  <arg name="drone_width" default="0.3" />
+  <arg name="drone_width" default="0.5" />
 
-  <arg name="config_small" default="$(find drone_localization_ros)/detectron2/configs/COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml" />
-  <arg name="model_small" default="$(find drone_localization_ros)/weights/t_resnet50_320x256.pth" />
-  <arg name="config_large" default="$(find drone_localization_ros)/detectron2/configs/COCO-Detection/faster_rcnn_X_101_32x8d_FPN_3x.yaml" />
-  <arg name="model_large" default="$(find drone_localization_ros)/weights/t_resnet101_880x680.pth" />
+  <arg name="config_rgb" default="~/workspace/src/drone_localization_ros_mmdet/configs/faster_rcnn_r50_fpn_rgb.py" />
+  <arg name="model_rgb" default="~/workspace/src/drone_localization_ros_mmdet/weights/rgb/small/epoch_8.pth" />
+  <arg name="config_thermal" default="~/workspace/src/drone_localization_ros_mmdet/configs/faster_rcnn_r50_fpn_rgb.py" />
+  <arg name="model_thermal" default="~/workspace/src/drone_localization_ros_mmdet/weights/t/small/epoch_17.pth" />
 
-  <arg name="visualization" default="true" />
+  <arg name="visualization" default="false" />
 
   <node name="drone_localization_ros"  pkg="drone_localization_ros" type="drone_localization_ros" output="screen" >
-    <param name="input_images" value="$(arg input_images)" />
+    <param name="input_rgb" value="$(arg input_rgb)" />
+    <param name="input_t" value="$(arg input_t)" />
     <param name="camera_info" value="$(arg camera_info)" />
     <param name="network_mode" value="$(arg network_mode)" />
-    <param name="is_fusion" value="$(arg is_fusion)" />
-    <param name="detection_threshold" value="$(arg detection_threshold)" />
     <param name="no_detections_treshold" value="$(arg no_detections_treshold)" />
     <param name="drone_width" value="$(arg drone_width)" />
-    <param name="config_small" value="$(arg config_small)" />
-    <param name="model_small" value="$(arg model_small)" />
-    <param name="config_large" value="$(arg config_large)" />
-    <param name="model_large" value="$(arg model_large)" />
+    <param name="config_rgb" value="$(arg config_rgb)" />
+    <param name="model_rgb" value="$(arg model_rgb)" />
+    <param name="config_thermal" value="$(arg config_thermal)" />
+    <param name="model_thermal" value="$(arg model_thermal)" />
     <param name="visualization" value="$(arg visualization)" />
   </node>
   </group>

@@ -1,27 +1,19 @@
-#!/usr/bin/env python
-
-# based on https://github.com/DavidFernandezChaves/Detectron2_ros
+#!/usr/bin/env python3
 
 import sys
 import threading
 import time
-
 import cv2 as cv
 import numpy as np
 import rospy
+
 from cv_bridge import CvBridge
 from image_geometry import PinholeCameraModel
 
-from detectron2.config import get_cfg
-from detectron2.data import MetadataCatalog
-from detectron2.utils.logger import setup_logger
-from detectron2.utils.visualizer import Visualizer
+from mmdet.apis import init_detector, inference_detector, show_result_pyplot
 
 from drone_localization_ros.msg import Detection, Detections, PosesWithCovariance
 from sensor_msgs.msg import Image, CameraInfo
-import message_filters
-
-from predictorNoResize import PredictorNoResize
 from localization import get_poses_msg
 
 
@@ -29,98 +21,51 @@ from localization import get_poses_msg
 class DroneLocalizationNode(object):
     def __init__(self):
         rospy.logwarn("Initializing")
-        setup_logger()
 
-        self.mode = self.load_param('~network_mode')  # small / large / dual
-        self.is_fusion = self.load_param('~is_fusion')  # use halfway fusion or not
-
-        if self.is_fusion:
-            from halfway_fusion.predictor import HalfwayFusionPredictor
+        self.mode = self.load_param('~network_mode')  # rgb / thermal / dual
+        self.current_mode = None
+        if self.mode == "dual":
+            self.current_mode = "rgb"
+            self.no_detections_treshold = self.load_param('~no_detections_treshold')
 
         self._bridge = CvBridge()
-        self._last_msg = None
+        self._last_msg_t = None
+        self._last_msg_rgb = None
         self._msg_lock = threading.Lock()
         self._image_counter = 0
 
         self.camera = PinholeCameraModel()
         self._camera_info = None
         self._drone_width = self.load_param('~drone_width')
-        self.covariance_xy = 0.05
-        self.covariance_z = 0.5
+        self._covariance_xy = 0.05
+        self._covariance_z = 0.5
 
         self.original_input_size = None
         self.input_size = (640, 512)
-
-        # either small or large neural network
-        if self.mode != "dual":
-            self.cfg1 = get_cfg()
-
-            if self.mode == "small":
-                self.cfg1.merge_from_file(self.load_param('~config_small'))
-                self.cfg1.MODEL.WEIGHTS = self.load_param('~model_small')
-
-            if self.mode == "large":
-                self.cfg1.merge_from_file(self.load_param('~config_large'))
-                self.cfg1.MODEL.WEIGHTS = self.load_param('~model_large')
-
-            self.cfg1.MODEL.ANCHOR_GENERATOR.SIZES = [[16, 32, 64, 128, 256]]
-            self.cfg1.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.load_param('~detection_threshold')
-            self.cfg1.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = [[0.5, 1.0]]
-            self.cfg1.MODEL.ROI_HEADS.NUM_CLASSES = 1 
-            self.cfg1.MODEL.DEVICE='cpu'  # for test and compatibility
-
-            if self.is_fusion:
-                self.cfg1.MODEL.META_ARCHITECTURE = "HalfwayFusionRCNN"
-                self.cfg1.MODEL.BACKBONE.NAME = "build_hw_fusion_resnet_fpn_backbone"
-                self.predictor = HalfwayFusionPredictor(self.cfg1)
-            else:
-                self.predictor = PredictorNoResize(self.cfg1)
-    
-        # both neural networks
-        if self.mode == "dual":
-            self.no_detections_treshold = self.load_param('~no_detections_treshold')
-
-            self.cfg1 = get_cfg()
-            self.cfg1.merge_from_file(self.load_param('~config_small'))
-            self.cfg1.MODEL.WEIGHTS = self.load_param('~model_small')
-
-            self.cfg2 = get_cfg()
-            self.cfg2.merge_from_file(self.load_param('~config_large'))
-            self.cfg2.MODEL.WEIGHTS = self.load_param('~model_large')
-
-            self.cfg1.MODEL.ANCHOR_GENERATOR.SIZES = self.cfg2.MODEL.ANCHOR_GENERATOR.SIZES = [[16, 32, 64, 128, 256]]            
-            self.cfg1.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.cfg2.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.load_param('~detection_threshold')
-            self.cfg1.MODEL.ROI_HEADS.NUM_CLASSES = self.cfg2.MODEL.ROI_HEADS.NUM_CLASSES = 1 
-            self.cfg1.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = self.cfg2.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = [[0.5, 1.0]]
-            self.cfg1.MODEL.DEVICE = self.cfg2.MODEL.DEVICE = 'cpu'  # for test and compatibility
-
-            if self.is_fusion:
-                self.cfg1.MODEL.META_ARCHITECTURE = self.cfg2.MODEL.META_ARCHITECTURE = "HalfwayFusionRCNN"
-                self.cfg1.MODEL.BACKBONE.NAME = self.cfg2.MODEL.META_ARCHITECTURE = "build_hw_fusion_resnet_fpn_backbone"
-                self.predictor1 = HalfwayFusionPredictor(self.cfg1)
-                self.predictor2 = HalfwayFusionPredictor(self.cfg2)
-            else:
-                self.predictor1 = PredictorNoResize(self.cfg1)
-                self.predictor2 = PredictorNoResize(self.cfg2)
-
-        MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]).set(thing_classes=["drone"])  # set class name
-        self._class_names = MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]).get("thing_classes", None)
+        
+        # load network parameters, create models
+        device = 'cuda:0'
+        if self.mode == "rgb" or self.mode == "dual":
+            config_file = self.load_param('~config_rgb')
+            checkpoint_file = self.load_param('~model_rgb')
+            self.model_rgb = init_detector(config_file, checkpoint_file, device=device)
+        if self.mode == "thermal" or self.mode == "dual":
+            config_file = self.load_param('~config_thermal')
+            checkpoint_file = self.load_param('~model_thermal')
+            self.model_thermal = init_detector(config_file, checkpoint_file, device=device)
 
         self._visualization = self.load_param('~visualization', True)
 
+        # init publishers and subsribers
         self._detections_pub = rospy.Publisher('~detections', Detections, queue_size=1)
         self._poses_pub = rospy.Publisher('~poses', PosesWithCovariance, queue_size=1)
         self._vis_pub = rospy.Publisher('~visualization', Image, queue_size=1)
-
-        if self.is_fusion:
-            sub_rgb = message_filters.Subscriber(self.load_param('~input_images_rgb'), Image, queue_size=1)
-            self._sub_cam_info_rgb = rospy.Subscriber(self.load_param('~camera_info_rgb'), CameraInfo, self.callback_cam_info, queue_size=1)
-            sub_t = message_filters.Subscriber(self.load_param('~input_images_t'), Image, queue_size=1)
-            self._sync_images = message_filters.ApproximateTimeSynchronizer([sub_rgb, sub_t], queue_size=5, slop=0.1)
-            self._sync_images.registerCallback(self.callback_sync_images)
-        else:
-            self._sub = rospy.Subscriber(self.load_param('~input_images'), Image, self.callback_image, queue_size=1)
-            self._sub_cam_info = rospy.Subscriber(self.load_param('~camera_info'), CameraInfo, self.callback_cam_info, queue_size=1)
+        self._sub_rgb = rospy.Subscriber(self.load_param('~input_rgb'), Image, self.callback_image_rgb, 
+                                        queue_size=1)
+        self._sub_t = rospy.Subscriber(self.load_param('~input_t'), Image, self.callback_image_t, 
+                                        queue_size=1)
+        self._sub_cam_info = rospy.Subscriber(self.load_param('~camera_info'), CameraInfo, 
+                                                self.callback_cam_info, queue_size=1)
 
         self.start_time = time.time()
         rospy.logwarn("Initialized")
@@ -132,47 +77,68 @@ class DroneLocalizationNode(object):
 
         while not rospy.is_shutdown():
             if self._msg_lock.acquire(False):
-                img_msg = self._last_msg
-                self._last_msg = None
+                img_msg_rgb = self._last_msg_rgb
+                img_msg_t = self._last_msg_t
+                self._last_msg_rgb = None
+                self._last_msg_t = None
                 self._msg_lock.release()
             else:
                 rate.sleep()
                 continue
 
-            if img_msg and self._camera_info:
-                # convert and resize one input image or both
-                if not self.is_fusion:
-                    np_image = self.convert_to_cv_image(img_msg)
-                    np_image = cv.resize(np_image, self.input_size)
+            if self.mode == "rgb":
+                img_msg = img_msg_rgb
+            elif self.mode == "thermal":
+                img_msg = img_msg_t
+            else:
+                if self.current_mode == "rgb":
+                    img_msg = img_msg_rgb
                 else:
-                    np_image_rgb, np_image_t = self.convert_to_cv_image(img_msg[0]), self.convert_to_cv_image(img_msg[1])
-                    crop_w = int(img_msg[1].height / img_msg[1].width * img_msg[0].width)
-                    diff = int((img_msg[0].width - crop_w) / 2)
-                    np_image_rgb = np_image_rgb[0:img_msg[0].height, diff:crop_w + diff] # crop rgb image
-                    np_image_rgb, np_image_t = cv.resize(np_image_rgb, self.input_size), cv.resize(np_image_t, self.input_size)
-                    np_image = np_image_rgb, np_image_t
+                    img_msg = img_msg_t
+
+            if img_msg and self._camera_info:
+                # convert and resize input image
+                np_image = self.convert_to_cv_image(img_msg)
+                np_image = cv.resize(np_image, self.input_size)
                 
-                # small or large mode (one neural network)
-                if self.mode != "dual":
-                    outputs = self.predictor(np_image)
+                # rgb or thermal mode (one neural network)
+                if self.mode == "rgb":
+                    outputs = inference_detector(self.model_rgb, np_image)
+                elif self.mode == "thermal":
+                    outputs = inference_detector(self.model_thermal, np_image)
 
                 # dual mode (two neural networks)
                 else:
                     if detections_counter < self.no_detections_treshold:
-                        outputs = self.predictor1(np_image)  # use faster network
+                        if self.current_mode == "rgb":
+                            outputs = inference_detector(self.model_rgb, np_image)
+                        else:
+                            outputs = inference_detector(self.model_thermal, np_image)
                     else:
-                        rospy.loginfo("[DroneLocalization]: Cannot detect target, using larger neural network for detection...")
-                        outputs = self.predictor2(np_image)  # use slower network if no detections for some number of images                      
+                        if self.current_mode == "rgb":
+                            self.current_mode = "thermal"
+                            img_msg = img_msg_t
+                            np_image = self.convert_to_cv_image(img_msg)
+                            np_image = cv.resize(np_image, self.input_size)
+                            outputs = inference_detector(self.model_thermal, np_image)
+                        else:
+                            self.current_mode = "rgb"
+                            img_msg = img_msg_rgb
+                            np_image = self.convert_to_cv_image(img_msg)
+                            np_image = cv.resize(np_image, self.input_size)
+                            outputs = inference_detector(self.model_rgb, np_image)
 
-                    if not detections:
+                        detections_counter = 0
+                        rospy.loginfo("[DroneLocalization]: Cannot detect target, \
+                                        changing to {} neural network".format(self.current_mode))                 
+
+                    if not outputs:
                         detections_counter += 1
                     else:
                         detections_counter = 0
 
-                detections = outputs["instances"].to("cpu") 
-
                 # publish detections
-                dets_msg = self.get_detections_msg(detections)
+                dets_msg = self.get_detections_msg(outputs)
                 self._detections_pub.publish(dets_msg)
                 #rospy.loginfo(dets_msg)
 
@@ -182,14 +148,11 @@ class DroneLocalizationNode(object):
                    
                 # visualize results
                 if self._visualization:
-                    if not self.is_fusion:
-                        v = Visualizer(np_image[:, :, ::-1], MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]), scale=1.0)
+                    if self.mode == "rgb" or self.mode == "dual":
+                        img = show_result_pyplot(self.model_rgb, np_image, outputs)
                     else:
-                        v = Visualizer(np_image[0][:, :, ::-1], MetadataCatalog.get(self.cfg1.DATASETS.TRAIN[0]), scale=1.0)
-                    v = v.draw_instance_predictions(detections)
-                    img = v.get_image()[:, :, ::-1]
-
-                    image_msg = self._bridge.cv2_to_imgmsg(img, 'bgr8')
+                        img = show_result_pyplot(self.model_thermal, np_image, outputs)
+                    image_msg = self._bridge.cv2_to_imgmsg(img) # , 'bgr8'
                     self._vis_pub.publish(image_msg)
 
                 # count processing time
@@ -201,18 +164,19 @@ class DroneLocalizationNode(object):
             rate.sleep()
 
 
-    def get_detections_msg(self, detections):
-        boxes = detections.pred_boxes if detections.has("pred_boxes") else None
+    def get_detections_msg(self, outputs):
+        if not outputs:
+            return None
 
         dets_msg = Detections()
         dets_msg.header = self._header
 
-        for i, (x1, y1, x2, y2) in enumerate(boxes):
+        for x1, y1, x2, y2, conf in outputs[0]:
             det_msg = Detection()
 
-            det_msg.class_id = detections.pred_classes[i].numpy()
-            det_msg.label = self._class_names[det_msg.class_id]
-            det_msg.confidence = detections.scores[i].numpy()
+            det_msg.class_id = 1
+            det_msg.label = "Drone"
+            det_msg.confidence = conf
 
             det_msg.xmin = np.uint32(x1)
             det_msg.ymin = np.uint32(y1)
@@ -231,33 +195,30 @@ class DroneLocalizationNode(object):
         cv_img = self._bridge.imgmsg_to_cv2(image_msg)
 
         if image_msg.encoding.lower() == 'mono8':
-            #cv_img = cv.cvtColor(cv_img, cv.COLOR_RGB2GRAY)
-            cv_img = cv.cvtColor(cv_img, cv.COLOR_GRAY2BGR)  # TODO - quick fix for now
+            cv_img = cv.cvtColor(cv_img, cv.COLOR_GRAY2BGR)
             cv_img = cv.normalize(cv_img, None, 0, 255, cv.NORM_MINMAX, cv.CV_8U)  # normalizing for thermal images
 
         return cv_img
 
 
-    def callback_sync_images(self, image_rgb, image_t):     
-        rospy.logdebug("Got both images")
-        crop_w = int(image_t.height / image_t.width * image_rgb.width)
-        if not self.original_input_size:
-            self.original_input_size = (crop_w, image_rgb.height)
-
-        if self._msg_lock.acquire(False):
-            self._last_msg = (image_rgb, image_t)
-            self._header = image_rgb.header
-            self._msg_lock.release()
-
-
-    def callback_image(self, msg):
-        rospy.logdebug("Got an image")
+    def callback_image_rgb(self, msg):
+        rospy.logdebug("Got an rgb image")
         if not self.original_input_size:
             self.original_input_size = (msg.width, msg.height)
-        if self._msg_lock.acquire(False):
-            self._last_msg = msg
-            self._header = msg.header
-            self._msg_lock.release()
+        if self.mode == "rgb":
+            if self._msg_lock.acquire(False):
+                self._last_msg_rgb = msg
+                self._header = msg.header
+                self._msg_lock.release()
+    
+
+    def callback_image_t(self, msg):
+        rospy.logdebug("Got a thermal image")
+        if self.mode == "thermal":
+            if self._msg_lock.acquire(False):
+                self._last_msg_t = msg
+                self._header = msg.header
+                self._msg_lock.release()
 
 
     def callback_cam_info(self, msg):
